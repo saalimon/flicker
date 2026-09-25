@@ -1,0 +1,54 @@
+@import "tailwindcss";
+
+/* Flicker's print palette, light and dark. Fonts come from next/font (layout.tsx). */
+:root {
+  --navy: #1D2340; --blue: #3255A4; --pink: #FF48B0; --yellow: #FFE800; --green: #00A95C; --orange: #FF6C2F;
+  --sheet: #F4F6F0; --ink: #1D2340; --ink-soft: #4F5775; --line: #1D2340;
+  --stage: #C3CEEA; --dots: #AAB8E0; --title: #3255A4; --tint: #A9C0F0; --track: #DCE2F2;
+  --display: var(--nf-display), "Big Shoulders Display", "Oswald", "Arial Narrow", Impact, sans-serif;
+  --body: var(--nf-body), "Atkinson Hyperlegible", "Segoe UI", system-ui, -apple-system, Roboto, sans-serif;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --sheet: #161B33; --ink: #EEF1F8; --ink-soft: #A9B1CE; --line: #8391C4;
+    --stage: #0F1328; --dots: #1D2548; --title: #8FAEF5; --tint: #8AA3DE; --track: #262E52;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --sheet: #161B33; --ink: #EEF1F8; --ink-soft: #A9B1CE; --line: #8391C4;
+  --stage: #0F1328; --dots: #1D2548; --title: #8FAEF5; --tint: #8AA3DE; --track: #262E52;
+  color-scheme: dark;
+}
+
+@theme inline {
+  --color-navy: var(--navy);
+  --color-blue: var(--blue);
+  --color-pink: var(--pink);
+  --color-yellow: var(--yellow);
+  --color-green: var(--green);
+  --color-orange: var(--orange);
+  --color-sheet: var(--sheet);
+  --color-ink: var(--ink);
+  --color-ink-soft: var(--ink-soft);
+  --color-line: var(--line);
+  --color-stage: var(--stage);
+  --color-dots: var(--dots);
+  --color-title: var(--title);
+  --color-track: var(--track);
+  --font-display: var(--display);
+  --font-body: var(--body);
+}
+
+html, body { min-height: 100%; }
+body {
+  margin: 0;
+  background-color: var(--stage);
+  background-image: radial-gradient(var(--dots) 1.7px, transparent 2px);
+  background-size: 18px 18px;
+  color: var(--ink);
+  font-family: var(--body);
+  -webkit-font-smoothing: antialiased;
+}
+:focus-visible { outline: 3px solid var(--pink); outline-offset: 3px; }
