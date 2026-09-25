@@ -37,6 +37,14 @@ describe("mockClassify", () => {
     expect(r.pace.value).toBe("frantic");
   });
 
+  test.each([
+    ["hard mode with lots of bombs", "classic"],
+    ["make it neon", "classic"],
+    ["2 minute workout to keep me moving", "classic"],
+  ])("a description without the word 'game' still counts: %p → %p", (text, mode) => {
+    expect(mockClassify(text).mode.value).toBe(mode);
+  });
+
   test("text that is not a game → none", () => {
     expect(mockClassify("buy milk and eggs").mode.value).toBe("none");
     expect(mockClassify("").mode.value).toBe("none");

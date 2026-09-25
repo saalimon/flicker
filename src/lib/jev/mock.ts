@@ -19,6 +19,9 @@ import {
  */
 
 const GAME_WORDS = /\b(game|round|dots?|pop(ping)?|play|level|score|targets?|challenge|test|arcade)\b/;
+// Words that only make sense when describing a game, even without the word "game".
+const GAME_SIGNALS =
+  /\b(bombs?|hazards?|traps?|mines?|minefield|lives|combos?|streaks?|workout|exercise|cardio|neon|pastel|monochrome|(easy|hard|expert) mode)\b|\bkeep me moving\b/;
 
 const MODE_CUES: Record<GameMode, RegExp[]> = {
   survival: [
@@ -95,7 +98,7 @@ export function mockClassify(input: string): IntentResult {
     scores[m] = n * CUE_WEIGHT;
     if (n) anyCue = true;
   }
-  const gameish = anyCue || GAME_WORDS.test(t);
+  const gameish = anyCue || GAME_WORDS.test(t) || GAME_SIGNALS.test(t);
   if (gameish) scores.classic += CLASSIC_BASE;
   scores.none = gameish ? 0 : NONE_SCORE;
 
