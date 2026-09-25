@@ -1,4 +1,5 @@
 import { PALETTES, type BadgeDef, type GameSpec } from "../spec";
+import { cameraGate } from "./camera";
 import { Fx } from "./fx";
 import { Game, type GameEvent, type Layout, type Region, type RoundStats, type Target } from "./game";
 import { Motion, SENS, captureFrame, type Pt, type SensLevel } from "./motion";
@@ -60,6 +61,7 @@ export function createStage(els: StageEls, spec: GameSpec, save: SaveData, ui: S
   let input: InputKind = null;
   let camBlocked = false;
   let stream: MediaStream | null = null;
+  const camGate = cameraGate();
   let dpr = 1;
   let raf = 0;
   let lastT = performance.now();
@@ -407,16 +409,21 @@ export function createStage(els: StageEls, spec: GameSpec, save: SaveData, ui: S
       return;
     }
     if (policyBlocksCamera() === true) return showBlocked();
+    const token = camGate.begin();
+    if (token === null) return; // already waiting for permission
     ui.status("Waiting for camera permission…");
     try {
-      stream = await navigator.mediaDevices.getUserMedia({
+      const next = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } },
         audio: false,
       });
-      if (destroyed) return stopStream();
+      if (!camGate.settle(token, next)) return; // the player moved on; the late stream was stopped
+      stopStream();
+      stream = next;
       els.video.srcObject = stream;
       await els.video.play().catch(() => {});
       if (!els.video.videoWidth) await new Promise((res) => els.video.addEventListener("loadedmetadata", res, { once: true }));
+      if (!camGate.isCurrent(token)) return; // switched to pointer or left while the video started
       input = "camera";
       if ("requestVideoFrameCallback" in HTMLVideoElement.prototype) {
         rvfc = true;
@@ -431,6 +438,9 @@ export function createStage(els: StageEls, spec: GameSpec, save: SaveData, ui: S
       layout();
       ui.status("Camera is on. Your movement shows up as pink dots.");
     } catch (err) {
+      const stale = !camGate.isCurrent(token);
+      camGate.settle(token, null);
+      if (stale) return;
       const name = err instanceof Error ? err.name : "";
       if (name === "NotAllowedError" || name === "SecurityError") {
         const state = await cameraPermission();
@@ -454,6 +464,7 @@ export function createStage(els: StageEls, spec: GameSpec, save: SaveData, ui: S
 
   function usePointer() {
     sfx.unlock();
+    camGate.cancel();
     stopStream();
     input = "pointer";
     ui.input(input, camBlocked);
@@ -562,6 +573,7 @@ export function createStage(els: StageEls, spec: GameSpec, save: SaveData, ui: S
 
   function destroy() {
     destroyed = true;
+    camGate.cancel();
     cancelAnimationFrame(raf);
     for (const id of timers) clearTimeout(id);
     ro.disconnect();
