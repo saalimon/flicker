@@ -1,0 +1,1292 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" data-keep>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" data-keep>
+<title data-keep>Flicker: a camera motion game</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" data-keep>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin data-keep>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@700;800;900&display=swap" data-keep>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&display=swap" data-keep>
+<!--
+  FLICKER — camera game driven by lightweight pixel-diff tracking. No libraries.
+
+  Tracking pipeline (runs once per new camera frame, ~30 Hz):
+    1. Draw the mirrored video into a tiny offscreen canvas (128 px wide).
+    2. Convert each pixel to luma: (77R + 150G + 29B) >> 8.
+    3. |luma - previous luma| > threshold  -> pixel is "moving" (binary mask).
+    4. Denoise: keep a moving pixel only if 2+ of its 4 neighbours also moved.
+    5. Global guard: if > 38% of the frame moved, treat it as camera shake or a
+       lighting change and ignore hits for that frame.
+    6. Hit test: for each target, count moving pixels inside its circle.
+       coverage > sensitivity ratio  -> hit (hazards need 2 frames in a row).
+    7. A decaying heat map (heat = moved ? 1 : heat * 0.82) draws the halftone trail.
+  Mouse/touch mode stamps the pointer path into the same mask, so the game logic
+  is identical for both inputs.
+-->
+<style data-keep>
+:root{
+  --navy:#1D2340; --blue:#3255A4; --pink:#FF48B0; --yellow:#FFE800; --green:#00A95C; --orange:#FF6C2F;
+  --sheet:#F4F6F0; --ink:#1D2340; --ink-soft:#4F5775; --line:#1D2340;
+  --stage:#C3CEEA; --dots:#AAB8E0; --title:#3255A4; --tint:#A9C0F0; --track:#DCE2F2;
+  --display:"Big Shoulders Display","Big Shoulders","Oswald","Arial Narrow",Impact,sans-serif;
+  --body:"Atkinson Hyperlegible","Segoe UI",system-ui,-apple-system,Roboto,sans-serif;
+  color-scheme:light;
+  box-sizing:border-box;
+  padding-top:env(safe-area-inset-top,0px);
+  padding-bottom:env(safe-area-inset-bottom,0px);
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --sheet:#161B33; --ink:#EEF1F8; --ink-soft:#A9B1CE; --line:#8391C4;
+    --stage:#0F1328; --dots:#1D2548; --title:#8FAEF5; --tint:#8AA3DE; --track:#262E52;
+    color-scheme:dark;
+  }
+}
+:root[data-theme="dark"]{
+  --sheet:#161B33; --ink:#EEF1F8; --ink-soft:#A9B1CE; --line:#8391C4;
+  --stage:#0F1328; --dots:#1D2548; --title:#8FAEF5; --tint:#8AA3DE; --track:#262E52;
+  color-scheme:dark;
+}
+*,*::before,*::after{box-sizing:border-box}
+html{height:100%;background:var(--stage);scroll-padding-top:env(safe-area-inset-top,0px)}
+body{height:100%;margin:0;background:var(--stage);color:var(--ink);font-family:var(--body);font-size:16px;line-height:1.45;overflow:hidden;-webkit-font-smoothing:antialiased}
+button{font:inherit;color:inherit}
+:focus-visible{outline:3px solid var(--pink);outline-offset:3px}
+[hidden]{display:none !important}
+.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+
+/* ---------- stage ---------- */
+.stage{position:relative;width:100%;height:100%;overflow:hidden;isolation:isolate;touch-action:none;
+  background-color:var(--stage);
+  background-image:radial-gradient(var(--dots) 1.7px, transparent 2px);
+  background-size:18px 18px}
+.cam{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;transform:scaleX(-1);
+  filter:grayscale(1) contrast(1.25) brightness(1.08);opacity:0;transition:opacity .5s}
+body[data-input="camera"] .cam{opacity:1}
+.tint{position:absolute;inset:0;pointer-events:none;display:none}
+body[data-input="camera"] .tint{display:block}
+.tint-lift{background:var(--navy);mix-blend-mode:lighten}
+.tint-mult{background:var(--tint);mix-blend-mode:multiply}
+.fx{position:absolute;inset:0;width:100%;height:100%;z-index:2;display:block}
+body[data-input="pointer"] .fx{cursor:crosshair}
+.stage.shake{animation:shake .32s linear}
+@keyframes shake{
+  0%,100%{transform:translate(0,0)} 20%{transform:translate(-9px,4px)} 40%{transform:translate(8px,-5px)}
+  60%{transform:translate(-6px,-3px)} 80%{transform:translate(5px,4px)}
+}
+.flash{position:absolute;inset:0;pointer-events:none;z-index:3}
+.flash.on{animation:flash .45s ease-out}
+@keyframes flash{from{box-shadow:inset 0 0 0 16px var(--orange)}to{box-shadow:inset 0 0 0 0 var(--orange)}}
+
+/* ---------- HUD ---------- */
+.hud{position:absolute;top:12px;left:12px;right:12px;z-index:3;display:grid;grid-template-columns:1fr auto 1fr;align-items:start;gap:10px;pointer-events:none}
+.tag{background:var(--sheet);color:var(--ink);border:2px solid var(--line);border-radius:8px;padding:6px 14px 8px;min-width:0}
+.hud-score{justify-self:start}
+.hud-time{justify-self:center;text-align:center;min-width:6.5rem}
+.hud-combo{justify-self:end;text-align:right}
+.big{font-family:var(--display);font-weight:800;font-size:clamp(2.3rem,6.4vw,4.4rem);line-height:.92;font-variant-numeric:tabular-nums;letter-spacing:.01em}
+.small{font-size:.9rem;color:var(--ink-soft);white-space:nowrap}
+.timebar{height:6px;margin-top:6px;background:var(--track);border-radius:3px;overflow:hidden}
+.timebar span{display:block;height:100%;background:var(--ink);transform-origin:left center}
+.hud-time.low{background:var(--pink);border-color:var(--navy);color:var(--navy)}
+.hud-time.low .timebar{background:rgba(29,35,64,.2)}
+.hud-time.low .timebar span{background:var(--navy)}
+.pulse{animation:pulse .35s ease-out}
+@keyframes pulse{0%{transform:scale(1)}40%{transform:scale(1.12)}100%{transform:scale(1)}}
+.hint{position:absolute;left:50%;bottom:20px;transform:translateX(-50%);z-index:3;background:var(--orange);color:var(--navy);
+  border:2px solid var(--navy);border-radius:8px;padding:8px 14px;font-weight:700;max-width:min(90%,420px);text-align:center;pointer-events:none}
+
+.controls{position:absolute;right:12px;bottom:12px;z-index:4;display:flex;gap:8px}
+.icon-btn{width:46px;height:46px;border-radius:50%;border:2px solid var(--line);background:var(--sheet);color:var(--ink);display:grid;place-items:center;cursor:pointer;padding:0}
+.icon-btn svg{width:22px;height:22px}
+.icon-btn[aria-pressed="false"]{opacity:.62}
+.icon-btn .slash{display:none}
+.icon-btn[aria-pressed="false"] .slash{display:inline}
+
+/* ---------- big type moments ---------- */
+.count{position:absolute;inset:0;z-index:4;display:grid;place-items:center;pointer-events:none;
+  font-family:var(--display);font-weight:900;font-size:clamp(7rem,30vw,17rem);line-height:1;color:var(--yellow);
+  -webkit-text-stroke:3px var(--navy);text-shadow:9px 7px 0 var(--pink)}
+.count.word{font-size:clamp(4rem,16vw,10rem)}
+.count.pop{animation:countpop .7s ease-out both}
+@keyframes countpop{0%{transform:scale(.55);opacity:0}25%{transform:scale(1.06);opacity:1}70%{transform:scale(1);opacity:1}100%{transform:scale(1);opacity:0}}
+.banner{position:absolute;left:0;right:0;top:32%;z-index:4;text-align:center;pointer-events:none;
+  font-family:var(--display);font-weight:900;font-size:clamp(3rem,10vw,6rem);color:var(--yellow);-webkit-text-stroke:2px var(--navy);text-shadow:6px 5px 0 var(--pink);opacity:0}
+.banner.show{animation:banner 1.3s ease-out both}
+@keyframes banner{0%{opacity:0;transform:translateY(14px)}15%{opacity:1;transform:none}75%{opacity:1}100%{opacity:0}}
+
+.toasts{position:absolute;right:12px;top:clamp(110px,16vh,150px);z-index:6;display:flex;flex-direction:column;gap:8px;align-items:flex-end;pointer-events:none}
+.toast{display:flex;gap:10px;align-items:center;background:var(--sheet);color:var(--ink);border:2px solid var(--line);border-radius:10px;padding:9px 14px 9px 10px;max-width:290px;animation:toastin .3s ease-out both}
+.toast.out{animation:toastout .3s ease-in both}
+.toast strong{display:block;font-size:.95rem}
+.toast span.d{font-size:.85rem;color:var(--ink-soft)}
+@keyframes toastin{from{opacity:0;transform:translateX(24px)}to{opacity:1;transform:none}}
+@keyframes toastout{to{opacity:0;transform:translateX(24px)}}
+
+/* ---------- sheets ---------- */
+.sheet{position:absolute;z-index:5;background:var(--sheet);color:var(--ink);border:2px solid var(--line);border-radius:16px;
+  box-shadow:7px 7px 0 var(--pink);padding:clamp(18px,2.6vw,28px);overflow:auto;touch-action:auto;overscroll-behavior:contain}
+.sheet.side{left:clamp(12px,4vw,56px);top:50%;transform:translateY(-50%);width:min(440px,calc(100% - 24px));max-height:calc(100% - 32px)}
+.sheet.center{left:50%;top:50%;transform:translate(-50%,-50%);width:min(360px,calc(100% - 32px));text-align:center}
+
+.title{margin:0 0 6px;font-family:var(--display);font-weight:900;font-size:clamp(4.2rem,11vw,7rem);line-height:.82;letter-spacing:.005em;color:var(--title);text-shadow:4px 3px 0 var(--pink)}
+.lede{margin:10px 0 16px;font-size:1.08rem;max-width:34ch}
+.legend{list-style:none;margin:0 0 18px;padding:0;display:grid;gap:10px}
+.legend li{display:grid;grid-template-columns:34px 1fr;gap:12px;align-items:start;font-size:.95rem}
+.legend svg{width:34px;height:34px}
+.legend strong{display:block}
+.status{margin:0 0 12px;font-size:.95rem;color:var(--ink-soft)}
+.status.error{color:var(--ink);background:rgba(255,108,47,.18);border-left:4px solid var(--orange);padding:8px 10px;border-radius:0 6px 6px 0}
+.cal{margin:0 0 14px;padding:12px 0 0;border-top:2px dashed var(--track)}
+.cal-row{display:flex;justify-content:space-between;align-items:baseline;gap:10px}
+.cal label{font-weight:700}
+.cal output{color:var(--ink-soft);font-size:.92rem}
+input[type=range]{width:100%;margin:8px 0 12px;accent-color:var(--pink)}
+.meter{height:10px;background:var(--track);border-radius:5px;overflow:hidden;margin:6px 0 8px}
+.meter span{display:block;height:100%;background:var(--pink);transform-origin:left center;transform:scaleX(0);transition:transform .08s linear}
+.meter.noisy span{background:var(--orange)}
+.cal-note{margin:0;font-size:.9rem;color:var(--ink-soft)}
+
+.actions{display:flex;flex-wrap:wrap;gap:10px 16px;align-items:center;margin:4px 0 18px}
+.btn{cursor:pointer;border-radius:10px;border:2px solid var(--navy);padding:10px 22px 12px;font-family:var(--display);font-weight:800;font-size:1.5rem;line-height:1;letter-spacing:.01em}
+.btn.primary{background:var(--yellow);color:var(--navy)}
+.btn.primary:hover{background:#FFF15C}
+.btn.primary:active{transform:translate(2px,2px)}
+.btn.link{border:0;background:none;padding:6px 2px;font-family:var(--body);font-weight:700;font-size:1rem;text-decoration:underline;text-underline-offset:3px;color:var(--ink)}
+
+.progress{border-top:2px dashed var(--track);padding-top:14px}
+.rank-row{display:flex;justify-content:space-between;align-items:baseline;gap:12px;font-size:.95rem}
+.rank-row .rk{font-family:var(--display);font-weight:800;font-size:1.35rem}
+.bar{height:8px;background:var(--track);border-radius:4px;overflow:hidden;margin:6px 0 4px}
+.bar span{display:block;height:100%;background:var(--blue);transform-origin:left center}
+:root:not([data-theme="light"]) .bar span{background:var(--title)}
+.muted{color:var(--ink-soft);font-size:.9rem;margin:0}
+details{margin-top:12px}
+summary{cursor:pointer;font-weight:700;padding:4px 0}
+summary .muted{font-weight:400;display:inline}
+.stamps{list-style:none;padding:0;margin:10px 0 0;display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px 14px}
+.stamp{display:grid;grid-template-columns:34px 1fr;gap:10px;align-items:center}
+.stamp-mark{width:34px;height:34px;border-radius:50%;border:2px dashed var(--ink-soft);display:grid;place-items:center}
+.stamp.got .stamp-mark{border:2px solid var(--navy);background:var(--pink);transform:rotate(-10deg)}
+.stamp-mark svg{width:18px;height:18px}
+.stamp strong{display:block;font-size:.92rem;line-height:1.2}
+.stamp .d{font-size:.8rem;color:var(--ink-soft);line-height:1.3}
+.stamp:not(.got) strong{color:var(--ink-soft)}
+.fineprint{margin:14px 0 0;font-size:.8rem;color:var(--ink-soft)}
+
+.end-note{margin:0 0 4px;font-weight:700;color:var(--ink);background:var(--yellow);color:var(--navy);display:inline-block;padding:2px 8px;border-radius:4px}
+.end-score{margin:4px 0 0;font-family:var(--display);font-weight:900;font-size:clamp(4.5rem,13vw,7.5rem);line-height:.85;color:var(--title);text-shadow:4px 3px 0 var(--pink);font-variant-numeric:tabular-nums}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:18px 0}
+.stats div{border-top:3px solid var(--ink);padding-top:6px}
+.stats dt{font-size:.8rem;color:var(--ink-soft)}
+.stats dd{margin:0;font-family:var(--display);font-weight:800;font-size:1.9rem;line-height:1}
+.panel-title{margin:0 0 8px;font-family:var(--display);font-weight:900;font-size:3rem;line-height:.9;color:var(--title)}
+.center .actions{justify-content:center;margin-bottom:0}
+
+@media (max-width:720px){
+  .sheet.side{left:8px;right:8px;width:auto;top:auto;bottom:8px;transform:none;max-height:64%;box-shadow:4px 4px 0 var(--pink);border-radius:14px}
+  .title{font-size:3.6rem}
+  .lede{margin:6px 0 12px}
+  .legend{gap:8px}
+  .stats{grid-template-columns:repeat(2,1fr)}
+  .tag{padding:4px 10px 6px}
+  .small{font-size:.78rem;white-space:normal;max-width:9.5rem}
+  .hud-combo .small{margin-left:auto}
+  .hud-time{min-width:4.8rem}
+  .toasts{left:12px;right:12px;align-items:stretch}
+  .toast{max-width:none}
+}
+@media (prefers-reduced-motion: reduce){
+  .stage.shake,.pulse,.flash.on{animation:none}
+  .count.pop{animation-duration:.01s;animation-delay:0s}
+  .banner.show{animation:banner 1.3s steps(1) both}
+  .toast,.toast.out{animation-duration:.01s}
+}
+</style>
+</head>
+<body data-input="none">
+<main class="stage" id="stage" data-keep>
+  <video class="cam" id="cam" playsinline muted autoplay></video>
+  <div class="tint tint-lift"></div>
+  <div class="tint tint-mult"></div>
+  <canvas class="fx" id="fx" aria-label="Game area"></canvas>
+  <div class="flash" id="flash"></div>
+
+  <div class="hud" id="hud" hidden aria-hidden="true">
+    <div class="tag hud-score"><div class="big" id="hScore">0</div><div class="small" id="hLevel">Level 1</div></div>
+    <div class="tag hud-time" id="hTimeTag"><div class="big" id="hTime">60</div><div class="timebar"><span id="hTimeBar"></span></div></div>
+    <div class="tag hud-combo" id="hComboTag"><div class="big" id="hMult">×1</div><div class="small" id="hCombo">Pop 5 in a row for ×2</div></div>
+  </div>
+  <p class="hint" id="hint" hidden>Too much is moving at once. Keep the camera still and step back a little.</p>
+  <div class="count" id="count" aria-hidden="true"></div>
+  <div class="banner" id="banner" aria-hidden="true"></div>
+  <div class="toasts" id="toasts"></div>
+
+  <div class="controls">
+    <button class="icon-btn" id="pauseBtn" hidden aria-label="Pause (Space)">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="5" width="4" height="14" rx="1" fill="currentColor"/><rect x="14" y="5" width="4" height="14" rx="1" fill="currentColor"/></svg>
+    </button>
+    <button class="icon-btn" id="trailBtn" aria-pressed="true" aria-label="Show motion trail (M)">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="6" r="2.4" fill="currentColor"/><circle cx="12" cy="9" r="1.8" fill="currentColor"/><circle cx="17.5" cy="12" r="1.3" fill="currentColor"/><circle cx="6" cy="14" r="1.8" fill="currentColor"/><circle cx="11" cy="17" r="1.3" fill="currentColor"/><path class="slash" d="M3 21 21 3" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg>
+    </button>
+    <button class="icon-btn" id="soundBtn" aria-pressed="true" aria-label="Sound">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9h4l5-4v14l-5-4H4z" fill="currentColor"/><path d="M16 8.5a5 5 0 0 1 0 7M18.5 6a8.5 8.5 0 0 1 0 12" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/><path class="slash" d="M3 21 21 3" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg>
+    </button>
+  </div>
+
+  <!-- start -->
+  <section class="sheet side" id="startPanel" aria-labelledby="gameTitle">
+    <h1 class="title" id="gameTitle">Flicker</h1>
+    <p class="lede">Your camera sees what moves. Wave at the yellow dots before they fade.</p>
+    <ul class="legend">
+      <li>
+        <svg viewBox="0 0 40 40" aria-hidden="true"><circle cx="21.6" cy="18.6" r="14.5" fill="none" stroke="#3255A4" stroke-width="2.4"/><circle cx="20" cy="20" r="14.5" fill="#FFE800" stroke="#1D2340" stroke-width="2.4"/><circle cx="20" cy="20" r="6" fill="none" stroke="#1D2340" stroke-width="2"/></svg>
+        <span><strong>Yellow dot</strong>Points. Pop five in a row to raise your multiplier, up to ×5.</span>
+      </li>
+      <li>
+        <svg viewBox="0 0 40 40" aria-hidden="true"><circle cx="20" cy="20" r="14.5" fill="#00A95C" stroke="#1D2340" stroke-width="2.4"/><path d="M20 11.5V20l6 3.5" stroke="#fff" stroke-width="3" fill="none" stroke-linecap="round"/></svg>
+        <span><strong>Green clock</strong>Big points and 3 extra seconds.</span>
+      </li>
+      <li>
+        <svg viewBox="0 0 40 40" aria-hidden="true"><defs><clipPath id="hzc"><circle cx="20" cy="20" r="14.5"/></clipPath></defs><circle cx="20" cy="20" r="14.5" fill="#FF6C2F"/><g clip-path="url(#hzc)" stroke="#1D2340" stroke-width="3.6"><path d="M-20 0 20 40M-10 0 30 40M0 0 40 40M10 0 50 40M20 0 60 40"/></g><circle cx="20" cy="20" r="14.5" fill="none" stroke="#1D2340" stroke-width="2.4"/></svg>
+        <span><strong>Striped dot</strong>Costs 3 seconds and your combo. Keep clear.</span>
+      </li>
+    </ul>
+
+    <p class="status" id="camStatus">You'll need a webcam. Stand back far enough that both hands fit in the frame.</p>
+    <div class="cal" id="calibrate" hidden>
+      <div class="cal-row"><label for="sens">Motion sensitivity</label><output id="sensOut" for="sens">Medium</output></div>
+      <input type="range" id="sens" min="1" max="5" step="1" value="3">
+      <div class="cal-row"><span class="muted">Movement right now</span></div>
+      <div class="meter" id="meter"><span id="meterFill"></span></div>
+      <p class="cal-note" id="calNote">Wave at the practice dot to test it. Raise sensitivity if it's hard to pop, lower it if it pops on its own.</p>
+    </div>
+    <p class="cal-note" id="pointerNote" hidden style="margin-bottom:14px">Sweep your mouse or finger across the practice dot to try it.</p>
+
+    <div class="actions">
+      <button class="btn primary" id="playBtn" hidden>Start round</button>
+      <button class="btn primary" id="camBtn">Turn on camera</button>
+      <button class="btn primary" id="dlBtn" hidden>Download the game</button>
+      <button class="btn link" id="pointerBtn">Play with mouse or touch</button>
+    </div>
+
+    <div class="progress">
+      <div class="rank-row"><span>Best score <strong id="bestScore">0</strong></span><span class="rk" id="rankName">Rookie</span></div>
+      <div class="bar"><span id="rankBar"></span></div>
+      <p class="muted" id="rankNext">600 XP to Mover</p>
+      <details>
+        <summary>Stamp card <span class="muted" id="badgeCount">0 of 10</span></summary>
+        <ul class="stamps" id="badgeGrid"></ul>
+      </details>
+    </div>
+    <p class="fineprint">Video stays on this device. Frames are compared inside the page and never uploaded.</p>
+  </section>
+
+  <!-- end of round -->
+  <section class="sheet side" id="endPanel" hidden aria-labelledby="endScore">
+    <p class="end-note" id="endNote" hidden></p>
+    <h2 class="end-score" id="endScore">0</h2>
+    <p class="muted">points this round</p>
+    <dl class="stats">
+      <div><dt>Accuracy</dt><dd id="stAcc">0%</dd></div>
+      <div><dt>Best combo</dt><dd id="stCombo">0</dd></div>
+      <div><dt>Level</dt><dd id="stLevel">1</dd></div>
+      <div><dt>Dots popped</dt><dd id="stPopped">0</dd></div>
+    </dl>
+    <div id="endStamps" hidden>
+      <p style="margin:0 0 4px;font-weight:700">New stamps</p>
+      <ul class="stamps" id="endStampList" style="margin-bottom:16px"></ul>
+    </div>
+    <div class="progress" style="border-top:0;padding-top:0;margin-bottom:18px">
+      <div class="rank-row"><span class="rk" id="endRank">Rookie</span><span id="endXp">+0 XP</span></div>
+      <div class="bar"><span id="endBar"></span></div>
+      <p class="muted" id="endNext"></p>
+    </div>
+    <div class="actions" style="margin-bottom:0">
+      <button class="btn primary" id="againBtn">Play again</button>
+      <button class="btn link" id="menuBtn">Settings and stamps</button>
+    </div>
+  </section>
+
+  <!-- pause -->
+  <section class="sheet center" id="pausePanel" hidden role="dialog" aria-labelledby="pauseTitle">
+    <h2 class="panel-title" id="pauseTitle">Paused</h2>
+    <p class="muted" style="margin-bottom:16px">Your score and time are frozen.</p>
+    <div class="actions">
+      <button class="btn primary" id="resumeBtn">Resume</button>
+      <button class="btn link" id="quitBtn">End round</button>
+    </div>
+  </section>
+
+  <div class="sr-only" id="live" role="status" aria-live="polite"></div>
+</main>
+
+<script id="game" data-keep>
+(() => {
+'use strict';
+
+/* ================================================================
+   Clean copy of this page, captured before anything changes, so it can be
+   saved and run as a local file (where the camera isn't blocked by a frame).
+   ================================================================ */
+const PRISTINE = (() => {
+  try {
+    const root = document.documentElement.cloneNode(true);
+    for (const a of Array.from(root.attributes)) if (a.name !== 'lang') root.removeAttribute(a.name);
+    const head = root.querySelector('head'), body = root.querySelector('body');
+    for (const parent of [head, body]) {
+      if (!parent) continue;
+      for (const el of Array.from(parent.children)) if (!el.hasAttribute('data-keep')) el.remove();
+    }
+    if (body) { for (const a of Array.from(body.attributes)) body.removeAttribute(a.name); body.setAttribute('data-input', 'none'); }
+    return '<!doctype html>\n' + root.outerHTML + '\n';
+  } catch (e) { return null; }
+})();
+
+/* ================================================================
+   Basics
+   ================================================================ */
+const TAU = Math.PI * 2;
+const C = { navy:'#1D2340', blue:'#3255A4', pink:'#FF48B0', yellow:'#FFE800', green:'#00A95C', orange:'#FF6C2F', paper:'#F4F6F0', white:'#FFFFFF' };
+const FONT = '"Big Shoulders Display","Big Shoulders","Oswald",Impact,sans-serif';
+const $ = (id) => document.getElementById(id);
+const stage = $('stage'), video = $('cam'), fx = $('fx'), ctx = fx.getContext('2d');
+const startPanel = $('startPanel'), endPanel = $('endPanel'), pausePanel = $('pausePanel'), hud = $('hud');
+const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const fmt = (n) => Math.round(n).toLocaleString();
+const easeOutBack = (k) => { const c1 = 1.70158, c3 = c1 + 1; return 1 + c3 * Math.pow(k - 1, 3) + c1 * Math.pow(k - 1, 2); };
+const easeOut = (k) => 1 - (1 - k) * (1 - k);
+
+/* ================================================================
+   Saved progress (per viewer, this browser only)
+   ================================================================ */
+const KEY = 'flicker.v1';
+const save = (() => {
+  const base = { best: 0, xp: 0, rounds: 0, badges: [], sens: 3, trails: true, sound: true };
+  try {
+    const raw = localStorage.getItem(KEY);
+    if (raw) {
+      const p = JSON.parse(raw) || {};
+      return { ...base, ...p, badges: Array.isArray(p.badges) ? p.badges.slice() : [] };
+    }
+  } catch (e) { /* storage unavailable: play without saving */ }
+  return base;
+})();
+if (!(save.sens >= 1 && save.sens <= 5)) save.sens = 3;
+function persist() { try { localStorage.setItem(KEY, JSON.stringify(save)); } catch (e) { /* ignore */ } }
+
+/* sensitivity: pixel diff threshold + share of a target's area that must move */
+const SENS = [null,
+  { diff: 44, ratio: 0.24, name: 'Lowest' },
+  { diff: 34, ratio: 0.18, name: 'Low' },
+  { diff: 26, ratio: 0.13, name: 'Medium' },
+  { diff: 20, ratio: 0.10, name: 'High' },
+  { diff: 15, ratio: 0.075, name: 'Highest' }];
+
+/* ================================================================
+   Motion engine: pixel diff on a tiny canvas
+   ================================================================ */
+const M = { PW: 128, PH: 96, prev: null, mask: null, clean: null, heat: null, global: 0, frames: 0 };
+const pc = document.createElement('canvas');
+const pctx = pc.getContext('2d', { willReadFrequently: true });
+
+function allocMotion(aspect) {
+  M.PH = Math.max(40, Math.round(M.PW * aspect));
+  pc.width = M.PW; pc.height = M.PH;
+  const n = M.PW * M.PH;
+  M.prev = new Uint8ClampedArray(n);
+  M.mask = new Uint8Array(n);
+  M.clean = new Uint8Array(n);
+  M.heat = new Float32Array(n);
+  M.frames = 0; M.global = 0;
+}
+
+function diffCamera() {
+  const PW = M.PW, PH = M.PH;
+  pctx.setTransform(-1, 0, 0, 1, PW, 0);           // mirror so it matches what the player sees
+  pctx.drawImage(video, 0, 0, PW, PH);
+  const d = pctx.getImageData(0, 0, PW, PH).data;
+  const prev = M.prev, mask = M.mask, T = SENS[save.sens].diff, n = PW * PH;
+  const first = M.frames === 0;
+  for (let i = 0, j = 0; i < n; i++, j += 4) {
+    const g = (d[j] * 77 + d[j + 1] * 150 + d[j + 2] * 29) >> 8;   // luma
+    mask[i] = (!first && Math.abs(g - prev[i]) > T) ? 1 : 0;
+    prev[i] = g;
+  }
+  M.frames++;
+  finishMask(true);
+}
+
+function finishMask(denoise) {
+  const PW = M.PW, PH = M.PH, mask = M.mask, clean = M.clean, heat = M.heat;
+  let count = 0;
+  if (denoise) {
+    clean.fill(0);
+    for (let y = 1; y < PH - 1; y++) {
+      const row = y * PW;
+      for (let x = 1; x < PW - 1; x++) {
+        const i = row + x;
+        if (!mask[i]) continue;
+        if (mask[i - 1] + mask[i + 1] + mask[i - PW] + mask[i + PW] >= 2) { clean[i] = 1; count++; }
+      }
+    }
+  } else {
+    for (let i = 0; i < mask.length; i++) { clean[i] = mask[i]; count += mask[i]; }
+  }
+  for (let i = 0; i < heat.length; i++) heat[i] = clean[i] ? 1 : heat[i] * 0.82;
+  M.global = count / (PW * PH);
+}
+
+/* pointer input writes into the same mask */
+const P = { pts: [], last: null };
+function toProc(e) {
+  const r = stage.getBoundingClientRect();
+  return { x: (e.clientX - r.left - map.ox) / map.dw * M.PW, y: (e.clientY - r.top - map.oy) / map.dh * M.PH };
+}
+function stampDisc(p, rad) {
+  const PW = M.PW, PH = M.PH, mask = M.mask, r2 = rad * rad;
+  const x0 = Math.max(0, Math.floor(p.x - rad)), x1 = Math.min(PW - 1, Math.ceil(p.x + rad));
+  const y0 = Math.max(0, Math.floor(p.y - rad)), y1 = Math.min(PH - 1, Math.ceil(p.y + rad));
+  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+    const dx = x + 0.5 - p.x, dy = y + 0.5 - p.y;
+    if (dx * dx + dy * dy <= r2) mask[y * PW + x] = 1;
+  }
+}
+function diffPointer() {
+  M.mask.fill(0);
+  const rad = Math.max(3, M.PW * 0.045);
+  let a = P.last;
+  for (const b of P.pts) {
+    if (a) {
+      const steps = Math.max(1, Math.ceil(Math.hypot(b.x - a.x, b.y - a.y) / (rad * 0.6)));
+      for (let s = 1; s <= steps; s++) stampDisc({ x: a.x + (b.x - a.x) * s / steps, y: a.y + (b.y - a.y) * s / steps }, rad);
+    } else stampDisc(b, rad);
+    a = b;
+  }
+  if (P.pts.length) P.last = P.pts[P.pts.length - 1];
+  P.pts = [];
+  M.frames++;
+  finishMask(false);
+}
+stage.addEventListener('pointermove', (e) => { if (input === 'pointer' && M.mask) P.pts.push(toProc(e)); });
+stage.addEventListener('pointerdown', (e) => { if (input === 'pointer' && M.mask) { P.last = null; P.pts.push(toProc(e)); } });
+stage.addEventListener('pointerleave', () => { P.last = null; });
+
+/* coverage of a target circle by moving pixels, 0..1 */
+function coverage(tg) {
+  const PW = M.PW, PH = M.PH, clean = M.clean;
+  const cx = tg.x * PW, cy = tg.y * PH, r = rDisp(tg) / map.ppx * 0.9, r2 = r * r;
+  const x0 = Math.max(0, Math.floor(cx - r)), x1 = Math.min(PW - 1, Math.ceil(cx + r));
+  const y0 = Math.max(0, Math.floor(cy - r)), y1 = Math.min(PH - 1, Math.ceil(cy + r));
+  let tot = 0, on = 0;
+  for (let y = y0; y <= y1; y++) {
+    const dy = y + 0.5 - cy;
+    for (let x = x0; x <= x1; x++) {
+      const dx = x + 0.5 - cx;
+      if (dx * dx + dy * dy <= r2) { tot++; on += clean[y * PW + x]; }
+    }
+  }
+  return tot ? on / tot : 0;
+}
+
+/* ================================================================
+   Layout: map video space (object-fit: cover) to screen space
+   ================================================================ */
+let input = null;   // 'camera' | 'pointer' | null
+const map = { CW: 0, CH: 0, dpr: 1, dw: 0, dh: 0, ox: 0, oy: 0, ppx: 1, ppy: 1, hudBottom: 12 };
+
+function layout() {
+  const r = stage.getBoundingClientRect();
+  map.CW = Math.max(1, r.width); map.CH = Math.max(1, r.height);
+  map.dpr = Math.min(2, window.devicePixelRatio || 1);
+  fx.width = Math.round(map.CW * map.dpr); fx.height = Math.round(map.CH * map.dpr);
+  let vw = map.CW, vh = map.CH;
+  if (input === 'camera' && video.videoWidth) { vw = video.videoWidth; vh = video.videoHeight; }
+  const s = Math.max(map.CW / vw, map.CH / vh);
+  map.dw = vw * s; map.dh = vh * s;
+  map.ox = (map.CW - map.dw) / 2; map.oy = (map.CH - map.dh) / 2;
+  const wantPH = Math.max(40, Math.round(M.PW * vh / vw));
+  if (!M.mask || wantPH !== M.PH) allocMotion(vh / vw);
+  map.ppx = map.dw / M.PW; map.ppy = map.dh / M.PH;
+  measureHud();
+  // practice dot may now sit under the panel: respawn it
+  if (G.mode === 'idle') { G.targets = G.targets.filter((t) => !t.practice); G.practiceAt = G.clock + 250; }
+}
+function measureHud() {
+  if (hud.hidden) { map.hudBottom = 12; return; }
+  const sr = stage.getBoundingClientRect(), hr = hud.getBoundingClientRect();
+  map.hudBottom = hr.bottom - sr.top + 10;
+}
+const dispX = (t) => map.ox + t.x * map.dw;
+const dispY = (t) => map.oy + t.y * map.dh;
+const rDisp = (t) => t.rf * Math.min(map.CW, map.CH);
+
+/* ================================================================
+   Sound: tiny WebAudio synth
+   ================================================================ */
+const sfx = (() => {
+  let ac = null;
+  function ensure() {
+    if (!ac) { const AC = window.AudioContext || window.webkitAudioContext; if (AC) { try { ac = new AC(); } catch (e) { ac = null; } } }
+    if (ac && ac.state === 'suspended') ac.resume();
+    return ac;
+  }
+  function tone(freq, dur, type, gain, when, slideTo) {
+    if (!save.sound) return;
+    const a = ensure(); if (!a) return;
+    const t0 = a.currentTime + (when || 0);
+    const o = a.createOscillator(), g = a.createGain();
+    o.type = type || 'sine';
+    o.frequency.setValueAtTime(freq, t0);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t0 + dur);
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(gain || 0.12, t0 + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    o.connect(g); g.connect(a.destination);
+    o.start(t0); o.stop(t0 + dur + 0.03);
+  }
+  return {
+    unlock: ensure,
+    pop(combo) { const f = 440 * Math.pow(2, Math.min(combo, 24) / 24); tone(f, 0.13, 'triangle', 0.17, 0, f * 1.6); },
+    gold() { [660, 880, 1320].forEach((f, i) => tone(f, 0.13, 'sine', 0.13, i * 0.07)); },
+    hazard() { tone(170, 0.38, 'square', 0.1, 0, 70); },
+    miss() { tone(320, 0.14, 'sine', 0.05, 0, 220); },
+    level() { [523, 659, 784, 1047].forEach((f, i) => tone(f, 0.16, 'triangle', 0.12, i * 0.08)); },
+    badge() { tone(988, 0.1, 'sine', 0.12); tone(1319, 0.22, 'sine', 0.12, 0.09); },
+    tick() { tone(1250, 0.05, 'square', 0.04); },
+    count(go) { tone(go ? 880 : 440, go ? 0.32 : 0.12, 'triangle', 0.15); },
+    end() { [784, 659, 523, 392].forEach((f, i) => tone(f, 0.2, 'triangle', 0.11, i * 0.11)); },
+  };
+})();
+
+/* ================================================================
+   Gamification: badges (stamps) and ranks
+   ================================================================ */
+const BADGES = [
+  { id: 'first',    name: 'First contact', desc: 'Pop your first dot.',                       test: (g) => g.hits >= 1 },
+  { id: 'combo10',  name: 'On a roll',     desc: 'Reach a 10-pop combo.',                     test: (g) => g.maxCombo >= 10 },
+  { id: 'combo25',  name: 'Unbroken',      desc: 'Reach a 25-pop combo.',                     test: (g) => g.maxCombo >= 25 },
+  { id: 'score500', name: 'Warmed up',     desc: 'Score 500 in one round.',                   test: (g) => g.score >= 500 },
+  { id: 'score1500',name: 'Blur',          desc: 'Score 1,500 in one round.',                 test: (g) => g.score >= 1500 },
+  { id: 'quick10',  name: 'Reflexes',      desc: 'Land 10 quick pops in one round.',          test: (g) => g.quick >= 10 },
+  { id: 'gold3',    name: 'Clock keeper',  desc: 'Catch 3 green clocks in one round.',        test: (g) => g.goldHits >= 3 },
+  { id: 'level6',   name: 'Deep end',      desc: 'Reach level 6.',                            test: (g) => g.level >= 6 },
+  { id: 'clean',    name: 'Clean hands',   desc: 'Score 300+ without touching a striped dot.', end: true, test: (g) => g.score >= 300 && g.hazardHits === 0 },
+  { id: 'rounds5',  name: 'Regular',       desc: 'Finish 5 rounds.',                          end: true, test: () => save.rounds >= 5 },
+];
+const RANKS = [
+  { xp: 0, name: 'Rookie' }, { xp: 600, name: 'Mover' }, { xp: 2000, name: 'Swatter' },
+  { xp: 5000, name: 'Quick hands' }, { xp: 10000, name: 'Blur' }, { xp: 20000, name: 'Flicker master' },
+];
+function rankOf(xp) {
+  let i = 0;
+  while (i + 1 < RANKS.length && xp >= RANKS[i + 1].xp) i++;
+  const cur = RANKS[i], next = RANKS[i + 1] || null;
+  return { i, name: cur.name, next, frac: next ? (xp - cur.xp) / (next.xp - cur.xp) : 1 };
+}
+const CHECK_SVG = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12.5 10 17 19 7" stroke="#1D2340" stroke-width="3.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+function stampItem(b, got) {
+  const li = document.createElement('li');
+  li.className = 'stamp' + (got ? ' got' : '');
+  const mark = document.createElement('span'); mark.className = 'stamp-mark'; mark.setAttribute('aria-hidden', 'true');
+  if (got) mark.innerHTML = CHECK_SVG;
+  const txt = document.createElement('span');
+  const s = document.createElement('strong'); s.textContent = b.name;
+  const d = document.createElement('span'); d.className = 'd'; d.textContent = b.desc;
+  txt.append(s, d);
+  li.append(mark, txt);
+  li.setAttribute('aria-label', `${b.name}. ${b.desc} ${got ? 'Earned.' : 'Not earned yet.'}`);
+  return li;
+}
+function checkBadges(atEnd) {
+  for (const b of BADGES) {
+    if (save.badges.includes(b.id)) continue;
+    if (b.end && !atEnd) continue;
+    if (b.test(G)) {
+      save.badges.push(b.id);
+      G.newBadges.push(b);
+      persist();
+      if (!atEnd) { toast(b); sfx.badge(); }
+      announce(`Stamp earned: ${b.name}`);
+    }
+  }
+}
+
+/* ================================================================
+   Game state
+   ================================================================ */
+const G = {
+  mode: 'idle', clock: 0, targets: [], parts: [], floats: [], seq: 0, practiceAt: 0,
+  score: 0, combo: 0, maxCombo: 0, hits: 0, misses: 0, popped: 0, quick: 0, goldHits: 0, hazardHits: 0,
+  level: 1, timeLeft: 60000, spawnIn: 0, lastSec: 61, newBadges: [], noisyFor: 0, cd: 0, cdT: 0,
+};
+const ROUND_MS = 60000;
+function resetRound() {
+  Object.assign(G, {
+    targets: [], score: 0, combo: 0, maxCombo: 0, hits: 0, misses: 0, popped: 0, quick: 0, goldHits: 0, hazardHits: 0,
+    level: 1, timeLeft: ROUND_MS, spawnIn: 500, lastSec: 61, newBadges: [], noisyFor: 0,
+  });
+  hudDirty = true;
+}
+const multiplier = () => Math.min(5, 1 + Math.floor(G.combo / 5));
+function levelCfg(L) {
+  return {
+    interval: Math.max(420, 1150 - (L - 1) * 80),
+    maxLive: Math.min(6, 2 + Math.floor(L / 2)),
+    life: Math.max(1500, 3400 - (L - 1) * 210),
+    size: Math.max(0.6, 1 - (L - 1) * 0.05),
+    hazard: L < 2 ? 0 : Math.min(0.32, 0.12 + (L - 2) * 0.03),
+    gold: 0.07,
+  };
+}
+function makeTarget(kind, dx, dy, rf, life, practice) {
+  return {
+    id: ++G.seq, kind, practice: !!practice, rf,
+    x: (dx - map.ox) / map.dw, y: (dy - map.oy) / map.dh,
+    born: G.clock, armAt: G.clock + 320, dieAt: G.clock + 320 + life,
+    state: 'live', goneAt: 0, hot: 0,
+  };
+}
+function spawn(cfg, forceOrb) {
+  let kind = 'orb';
+  if (!forceOrb) {
+    const roll = Math.random();
+    if (roll < cfg.hazard) kind = 'hazard';
+    else if (roll < cfg.hazard + cfg.gold) kind = 'gold';
+  }
+  const minD = Math.min(map.CW, map.CH);
+  const rf = 0.085 * cfg.size * (kind === 'gold' ? 0.85 : 1);
+  const r = rf * minD;
+  const left = r + 16, right = map.CW - r - 16;
+  const top = map.hudBottom + r + 6, bottom = map.CH - r - 68;
+  if (right <= left || bottom <= top) return;
+  for (let k = 0; k < 14; k++) {
+    const dx = left + Math.random() * (right - left), dy = top + Math.random() * (bottom - top);
+    const clear = G.targets.every((o) => o.state !== 'live' || Math.hypot(dispX(o) - dx, dispY(o) - dy) > rDisp(o) + r + 24);
+    if (clear) {
+      const life = kind === 'hazard' ? cfg.life * 1.25 : kind === 'gold' ? cfg.life * 0.8 : cfg.life;
+      G.targets.push(makeTarget(kind, dx, dy, rf, life, false));
+      return;
+    }
+  }
+}
+function practiceRegion(r) {
+  const sr = stage.getBoundingClientRect(), pr = startPanel.getBoundingClientRect();
+  const pRight = pr.right - sr.left, pTop = pr.top - sr.top;
+  if (map.CW - pRight > 2 * r + 70) return { x0: pRight + r + 36, x1: map.CW - r - 30, y0: r + 30, y1: map.CH - r - 80 };
+  if (pTop > 2 * r + 50) return { x0: r + 24, x1: map.CW - r - 24, y0: r + 20, y1: pTop - r - 20 };
+  return null;
+}
+function spawnPractice() {
+  const rf = 0.075, r = rf * Math.min(map.CW, map.CH);
+  const reg = practiceRegion(r);
+  if (!reg || reg.x1 < reg.x0 || reg.y1 < reg.y0) { G.practiceAt = G.clock + 1000; return; }
+  const dx = reg.x0 + Math.random() * (reg.x1 - reg.x0), dy = reg.y0 + Math.random() * (reg.y1 - reg.y0);
+  G.targets.push(makeTarget('orb', dx, dy, rf, Infinity, true));
+}
+
+function hitTarget(tg) {
+  tg.state = 'hit'; tg.goneAt = G.clock;
+  const x = dispX(tg), y = dispY(tg);
+  if (tg.practice) {
+    burst(x, y, [C.yellow, C.pink, C.navy], 16);
+    floater(x, y, 'Nice', C.navy, 30);
+    sfx.pop(4);
+    G.practiceAt = G.clock + 650;
+    return;
+  }
+  if (tg.kind === 'hazard') {
+    G.hazardHits++; G.combo = 0;
+    G.timeLeft = Math.max(0, G.timeLeft - 3000);
+    burst(x, y, [C.orange, C.navy], 22);
+    floater(x, y, '−3s', C.orange, 40);
+    sfx.hazard();
+    kick();
+  } else {
+    const before = multiplier();
+    G.combo++; G.maxCombo = Math.max(G.maxCombo, G.combo); G.popped++; G.hits++;
+    const mult = multiplier();
+    let pts;
+    if (tg.kind === 'gold') {
+      pts = 50 * mult; G.goldHits++; G.timeLeft += 3000;
+      burst(x, y, [C.green, C.yellow, C.white], 24);
+      floater(x, y - 26, '+3s', C.green, 30);
+      sfx.gold();
+    } else {
+      pts = 10 * mult;
+      if (G.clock - tg.armAt < 550) { pts += 5; G.quick++; floater(x, y - 30, 'Quick', C.blue, 22); }
+      burst(x, y, [C.yellow, C.pink, C.navy], 16);
+      sfx.pop(G.combo);
+    }
+    G.score += pts;
+    floater(x, y, '+' + pts, C.navy, 36);
+    if (mult > before) pulse($('hComboTag'));
+    const newLevel = Math.min(10, 1 + Math.floor(G.popped / 8));
+    if (newLevel > G.level) { G.level = newLevel; showBanner('Level ' + newLevel); sfx.level(); announce('Level ' + newLevel); }
+  }
+  hudDirty = true;
+  checkBadges(false);
+}
+function miss(tg) {
+  G.misses++;
+  if (G.combo >= 3) floater(dispX(tg), dispY(tg), 'Combo lost', C.navy, 24);
+  G.combo = 0;
+  hudDirty = true;
+  sfx.miss();
+}
+
+/* per new motion frame: hit detection */
+let meterNoisy = null;
+function motionTick() {
+  const cam = input === 'camera';
+  if (cam && !startPanel.hidden) updateMeter();
+  if (G.mode !== 'playing' && G.mode !== 'idle') return;
+  const noisy = cam && M.global > 0.38;
+  if (G.mode === 'playing') { G.noisyFor = noisy ? G.noisyFor + 33 : 0; setHint(G.noisyFor > 700); }
+  if (noisy || M.frames < 3) { for (const tg of G.targets) tg.hot = 0; return; }
+  const thr = SENS[save.sens].ratio;
+  for (const tg of G.targets) {
+    if (tg.state !== 'live' || G.clock < tg.armAt) continue;
+    if (G.mode === 'idle' && !tg.practice) continue;
+    const ratio = coverage(tg);
+    tg.hot = ratio > thr ? tg.hot + 1 : 0;
+    if (tg.hot >= (tg.kind === 'hazard' ? 2 : 1)) hitTarget(tg);   // hazards need 2 frames: forgiving for good things, strict for bad ones
+  }
+}
+function updateMeter() {
+  $('meterFill').style.transform = `scaleX(${Math.min(1, M.global / 0.12).toFixed(3)})`;
+  const noisy = M.global > 0.38;
+  if (noisy !== meterNoisy) {
+    meterNoisy = noisy;
+    $('meter').classList.toggle('noisy', noisy);
+    $('calNote').textContent = noisy
+      ? 'Too much is moving at once. Keep the camera still and check the lighting.'
+      : 'Wave at the practice dot to test it. Raise sensitivity if it’s hard to pop, lower it if it pops on its own.';
+  }
+}
+let hintShown = false;
+function setHint(on) { if (on !== hintShown) { hintShown = on; $('hint').hidden = !on; } }
+
+/* ================================================================
+   Loop
+   ================================================================ */
+let lastT = performance.now(), procAcc = 0, newVideoFrame = false, rvfc = false, hudDirty = true;
+
+function frame(t) {
+  const dt = Math.min(64, t - lastT); lastT = t;
+  if (G.mode !== 'paused') G.clock += dt;
+
+  if (input === 'camera') {
+    if (!rvfc) { procAcc += dt; if (procAcc >= 33) { procAcc = 0; newVideoFrame = true; } }
+    if (newVideoFrame && video.readyState >= 2 && video.videoWidth) { newVideoFrame = false; diffCamera(); motionTick(); }
+  } else if (input === 'pointer') {
+    procAcc += dt;
+    if (procAcc >= 33) { procAcc = 0; diffPointer(); motionTick(); }
+  }
+
+  if (G.mode === 'countdown') tickCountdown(dt);
+  else if (G.mode === 'playing') update(dt);
+  else if (G.mode === 'idle') tickIdle();
+  if (G.mode !== 'paused') updateFx(dt);
+  if (G.mode === 'over') G.targets = G.targets.filter((tg) => G.clock - tg.goneAt < 450);
+
+  render();
+  if (hudDirty) drawHud();
+  requestAnimationFrame(frame);
+}
+
+function update(dt) {
+  G.timeLeft -= dt;
+  const sec = Math.max(0, Math.ceil(G.timeLeft / 1000));
+  if (sec !== G.lastSec) { if (sec <= 5 && sec > 0 && sec < G.lastSec) sfx.tick(); G.lastSec = sec; hudDirty = true; }
+  $('hTimeBar').style.transform = `scaleX(${clamp(G.timeLeft / ROUND_MS, 0, 1).toFixed(4)})`;
+  if (G.timeLeft <= 0) { endRound(); return; }
+
+  for (const tg of G.targets) {
+    if (tg.state === 'live' && G.clock >= tg.dieAt) { tg.state = 'gone'; tg.goneAt = G.clock; if (tg.kind === 'orb') miss(tg); }
+  }
+  G.targets = G.targets.filter((tg) => tg.state === 'live' || G.clock - tg.goneAt < 450);
+
+  const cfg = levelCfg(G.level);
+  const live = G.targets.filter((tg) => tg.state === 'live');
+  const good = live.filter((tg) => tg.kind !== 'hazard').length;
+  G.spawnIn -= dt;
+  if (good === 0 && G.spawnIn > 350) G.spawnIn = 350;   // never leave the player with nothing to hit
+  if (G.spawnIn <= 0) {
+    if (live.length < cfg.maxLive) spawn(cfg, good === 0);
+    G.spawnIn = cfg.interval * (0.75 + Math.random() * 0.5);
+  }
+}
+
+function tickIdle() {
+  if (!input || startPanel.hidden) return;
+  G.targets = G.targets.filter((tg) => tg.state === 'live' || G.clock - tg.goneAt < 450);
+  if (!G.targets.some((t) => t.practice && t.state === 'live') && G.clock >= G.practiceAt) spawnPractice();
+}
+
+function tickCountdown(dt) {
+  G.cdT += dt;
+  if (G.cdT < 800) return;
+  G.cdT = 0; G.cd--;
+  if (G.cd > 0) { showCount(String(G.cd)); sfx.count(false); }
+  else { showCount('Go', true); sfx.count(true); G.mode = 'playing'; M.frames = 0; $('pauseBtn').hidden = false; }
+}
+
+/* ================================================================
+   Effects
+   ================================================================ */
+function burst(x, y, colors, n) {
+  if (reduceMotion) n = Math.ceil(n / 3);
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * TAU, sp = 140 + Math.random() * 260;
+    G.parts.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 90, life: 0, max: 450 + Math.random() * 350,
+      size: 4 + Math.random() * 7, rot: Math.random() * TAU, vr: (Math.random() - 0.5) * 12, color: colors[i % colors.length], sq: Math.random() < 0.5 });
+  }
+}
+function floater(x, y, text, color, size) { G.floats.push({ x, y, text, color, size, life: 0, max: 900 }); }
+function updateFx(dt) {
+  const s = dt / 1000;
+  for (const p of G.parts) { p.life += dt; p.vy += 700 * s; p.x += p.vx * s; p.y += p.vy * s; p.rot += p.vr * s; }
+  G.parts = G.parts.filter((p) => p.life < p.max);
+  for (const f of G.floats) f.life += dt;
+  G.floats = G.floats.filter((f) => f.life < f.max);
+}
+function kick() {
+  const fl = $('flash'); fl.classList.remove('on'); void fl.offsetWidth; fl.classList.add('on');
+  if (!reduceMotion) { stage.classList.remove('shake'); void stage.offsetWidth; stage.classList.add('shake'); }
+}
+function pulse(el) { el.classList.remove('pulse'); void el.offsetWidth; el.classList.add('pulse'); }
+function showCount(text, word) {
+  const el = $('count');
+  el.textContent = text;
+  el.classList.toggle('word', !!word);
+  el.classList.remove('pop'); void el.offsetWidth; el.classList.add('pop');
+}
+function showBanner(text) { const b = $('banner'); b.textContent = text; b.classList.remove('show'); void b.offsetWidth; b.classList.add('show'); }
+function toast(b) {
+  const box = $('toasts');
+  const el = document.createElement('div'); el.className = 'toast';
+  const mark = document.createElement('span'); mark.className = 'stamp-mark'; mark.style.cssText = 'border:2px solid #1D2340;background:#FF48B0;transform:rotate(-10deg);flex:none'; mark.innerHTML = CHECK_SVG;
+  const txt = document.createElement('span');
+  const s = document.createElement('strong'); s.textContent = 'Stamp earned: ' + b.name;
+  const d = document.createElement('span'); d.className = 'd'; d.textContent = b.desc;
+  txt.append(s, d); el.append(mark, txt); box.append(el);
+  setTimeout(() => { el.classList.add('out'); setTimeout(() => el.remove(), 320); }, 3200);
+}
+function announce(msg) { const l = $('live'); l.textContent = ''; setTimeout(() => { l.textContent = msg; }, 30); }
+
+/* ================================================================
+   Rendering
+   ================================================================ */
+function render() {
+  ctx.setTransform(map.dpr, 0, 0, map.dpr, 0, 0);
+  ctx.clearRect(0, 0, map.CW, map.CH);
+  if (save.trails && M.heat && input) drawTrails();
+  drawTargets();
+  drawParticles();
+  drawFloats();
+}
+
+/* halftone trail: one dot per 2x2 block, sized by recent motion */
+function drawTrails() {
+  const PW = M.PW, PH = M.PH, heat = M.heat;
+  const ppx = map.ppx, ppy = map.ppy, ox = map.ox, oy = map.oy;
+  const maxR = Math.min(ppx, ppy) * 1.02;
+  ctx.fillStyle = C.pink;
+  ctx.globalAlpha = 0.88;
+  ctx.beginPath();
+  for (let y = 0; y < PH - 1; y += 2) {
+    const cy = oy + (y + 1) * ppy;
+    if (cy < -maxR || cy > map.CH + maxR) continue;
+    const row = y * PW;
+    for (let x = 0; x < PW - 1; x += 2) {
+      const i = row + x;
+      let h = heat[i];
+      if (heat[i + 1] > h) h = heat[i + 1];
+      if (heat[i + PW] > h) h = heat[i + PW];
+      if (heat[i + PW + 1] > h) h = heat[i + PW + 1];
+      if (h < 0.12) continue;
+      const cx = ox + (x + 1) * ppx, r = maxR * h;
+      ctx.moveTo(cx + r, cy);
+      ctx.arc(cx, cy, r, 0, TAU);
+    }
+  }
+  ctx.fill();
+  ctx.globalAlpha = 1;
+}
+
+function drawTargets() {
+  for (const tg of G.targets) {
+    const x = dispX(tg), y = dispY(tg), R = rDisp(tg);
+    let sc = 1, alpha = 1;
+    if (tg.state === 'live') {
+      sc = easeOutBack(clamp((G.clock - tg.born) / 280, 0, 1));
+      if (G.clock < tg.armAt) alpha = 0.75;
+    } else {
+      const k = clamp((G.clock - tg.goneAt) / (tg.state === 'hit' ? 220 : 400), 0, 1);
+      if (tg.state === 'hit') { sc = 1 + 0.4 * k; alpha = 1 - k; } else { sc = 1 - 0.6 * k; alpha = 1 - k; }
+    }
+    if (alpha <= 0 || sc <= 0) continue;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.translate(x, y);
+    ctx.scale(sc, sc);
+    if (tg.kind === 'hazard') drawHazard(R);
+    else if (tg.kind === 'gold') drawClock(R);
+    else drawOrb(R);
+    ctx.restore();
+    if (tg.state === 'live' && !tg.practice && tg.kind !== 'hazard' && G.clock >= tg.armAt) {
+      drawRing(x, y, R, clamp((tg.dieAt - G.clock) / (tg.dieAt - tg.armAt), 0, 1));
+    }
+  }
+}
+function drawOrb(R) {
+  const lw = Math.max(2, R * 0.07);
+  ctx.lineWidth = lw;
+  ctx.strokeStyle = C.blue;                         // misregistered print outline
+  ctx.beginPath(); ctx.arc(R * 0.1, -R * 0.08, R, 0, TAU); ctx.stroke();
+  ctx.fillStyle = C.yellow;
+  ctx.beginPath(); ctx.arc(0, 0, R, 0, TAU); ctx.fill();
+  ctx.strokeStyle = C.navy; ctx.stroke();
+  ctx.lineWidth = Math.max(1.5, R * 0.055);
+  ctx.beginPath(); ctx.arc(0, 0, R * 0.42, 0, TAU); ctx.stroke();
+}
+function drawClock(R) {
+  ctx.lineWidth = Math.max(2, R * 0.07);
+  ctx.strokeStyle = C.blue;
+  ctx.beginPath(); ctx.arc(R * 0.1, -R * 0.08, R, 0, TAU); ctx.stroke();
+  ctx.fillStyle = C.green;
+  ctx.beginPath(); ctx.arc(0, 0, R, 0, TAU); ctx.fill();
+  ctx.strokeStyle = C.navy; ctx.stroke();
+  const a = G.clock / 260;
+  ctx.strokeStyle = C.white; ctx.lineCap = 'round'; ctx.lineWidth = Math.max(2.5, R * 0.13);
+  ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, -R * 0.58); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(Math.cos(a) * R * 0.5, Math.sin(a) * R * 0.5); ctx.stroke();
+}
+function drawHazard(R) {
+  ctx.save();
+  ctx.beginPath(); ctx.arc(0, 0, R, 0, TAU);
+  ctx.fillStyle = C.orange; ctx.fill();
+  ctx.clip();
+  ctx.rotate(G.clock / 1500);
+  ctx.strokeStyle = C.navy; ctx.lineWidth = R * 0.17;
+  const sp = R * 0.46;
+  ctx.beginPath();
+  for (let k = -4; k <= 4; k++) { ctx.moveTo(k * sp - R * 1.6, -R * 1.6); ctx.lineTo(k * sp + R * 1.6, R * 1.6); }
+  ctx.stroke();
+  ctx.restore();
+  ctx.lineWidth = Math.max(2, R * 0.08); ctx.strokeStyle = C.navy;
+  ctx.beginPath(); ctx.arc(0, 0, R, 0, TAU); ctx.stroke();
+}
+function drawRing(x, y, R, frac) {
+  const rr = R + Math.max(6, R * 0.17), a0 = -Math.PI / 2, a1 = a0 + TAU * frac;
+  ctx.lineCap = 'round';
+  ctx.strokeStyle = C.navy; ctx.lineWidth = Math.max(5, R * 0.12) + 3;
+  ctx.beginPath(); ctx.arc(x, y, rr, a0, a1); ctx.stroke();
+  ctx.strokeStyle = frac < 0.3 ? C.orange : C.white; ctx.lineWidth = Math.max(5, R * 0.12);
+  ctx.beginPath(); ctx.arc(x, y, rr, a0, a1); ctx.stroke();
+}
+function drawParticles() {
+  for (const p of G.parts) {
+    ctx.globalAlpha = 1 - p.life / p.max;
+    ctx.fillStyle = p.color;
+    if (p.sq) {
+      ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.rot); ctx.fillRect(-p.size / 2, -p.size / 2, p.size, p.size); ctx.restore();
+    } else { ctx.beginPath(); ctx.arc(p.x, p.y, p.size / 2, 0, TAU); ctx.fill(); }
+  }
+  ctx.globalAlpha = 1;
+}
+function drawFloats() {
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.lineJoin = 'round';
+  for (const f of G.floats) {
+    const k = f.life / f.max;
+    ctx.globalAlpha = 1 - k * k;
+    ctx.font = `800 ${f.size}px ${FONT}`;
+    const y = f.y - 54 * easeOut(k);
+    ctx.lineWidth = 6; ctx.strokeStyle = C.paper; ctx.strokeText(f.text, f.x, y);
+    ctx.fillStyle = f.color; ctx.fillText(f.text, f.x, y);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawHud() {
+  hudDirty = false;
+  $('hScore').textContent = fmt(G.score);
+  $('hLevel').textContent = 'Level ' + G.level;
+  const sec = Math.max(0, Math.ceil(G.timeLeft / 1000));
+  $('hTime').textContent = sec;
+  $('hTimeTag').classList.toggle('low', G.mode === 'playing' && sec <= 10);
+  const m = multiplier();
+  $('hMult').textContent = '×' + m;
+  $('hCombo').textContent = G.combo === 0 ? 'Pop 5 in a row for ×2'
+    : `${G.combo} in a row`;
+}
+
+/* ================================================================
+   Flow: panels, rounds, pause
+   ================================================================ */
+function refreshStart() {
+  $('bestScore').textContent = fmt(save.best);
+  const rk = rankOf(save.xp);
+  $('rankName').textContent = rk.name;
+  $('rankBar').style.transform = `scaleX(${rk.frac.toFixed(4)})`;
+  $('rankNext').textContent = rk.next ? `${fmt(rk.next.xp - save.xp)} XP to ${rk.next.name}. Every point you score is XP.` : 'Top rank reached.';
+  const grid = $('badgeGrid'); grid.innerHTML = '';
+  for (const b of BADGES) grid.append(stampItem(b, save.badges.includes(b.id)));
+  $('badgeCount').textContent = `${save.badges.length} of ${BADGES.length}`;
+}
+function setInputUI() {
+  document.body.dataset.input = input || 'none';
+  const cam = input === 'camera';
+  $('calibrate').hidden = !cam;
+  $('pointerNote').hidden = input !== 'pointer';
+  $('playBtn').hidden = !input;
+  const camBtn = $('camBtn');
+  camBtn.hidden = cam || camBlocked;
+  camBtn.className = input ? 'btn link' : 'btn primary';
+  camBtn.textContent = input === 'pointer' ? 'Use camera instead' : 'Turn on camera';
+  const dl = $('dlBtn');
+  dl.hidden = !(camBlocked && downloads && PRISTINE);
+  dl.className = input ? 'btn link' : 'btn primary';
+  $('pointerBtn').hidden = !!input;
+}
+function showStart() {
+  G.mode = 'idle';
+  endPanel.hidden = true; pausePanel.hidden = true; hud.hidden = true;
+  $('pauseBtn').hidden = true; setHint(false);
+  startPanel.hidden = false;
+  G.targets = []; G.practiceAt = G.clock + 300;
+  refreshStart(); measureHud();
+}
+function beginCountdown() {
+  sfx.unlock();
+  if (!input) return;
+  if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+  startPanel.hidden = true; endPanel.hidden = true; pausePanel.hidden = true;
+  resetRound();
+  hud.hidden = false; measureHud(); drawHud();
+  $('hTimeBar').style.transform = 'scaleX(1)';
+  G.mode = 'countdown'; G.cd = 3; G.cdT = 0;
+  showCount('3'); sfx.count(false);
+}
+function pauseGame() {
+  if (G.mode !== 'playing') return;
+  G.mode = 'paused';
+  pausePanel.hidden = false;
+  $('resumeBtn').focus();
+}
+function resumeGame() {
+  if (G.mode !== 'paused') return;
+  pausePanel.hidden = true;
+  M.frames = 0;                 // re-prime the diff so a stale frame can't fire hits
+  for (const tg of G.targets) tg.hot = 0;
+  G.mode = 'playing';
+  if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+}
+function endRound() {
+  if (G.mode !== 'playing' && G.mode !== 'paused') return;
+  G.mode = 'over';
+  pausePanel.hidden = true; $('pauseBtn').hidden = true; setHint(false);
+  G.timeLeft = Math.max(0, G.timeLeft); hudDirty = true;
+  for (const tg of G.targets) if (tg.state === 'live') { tg.state = 'gone'; tg.goneAt = G.clock; }
+  const before = rankOf(save.xp);
+  save.rounds++; save.xp += G.score;
+  const isBest = G.score > save.best; if (isBest) save.best = G.score;
+  checkBadges(true);
+  persist();
+  const after = rankOf(save.xp);
+  sfx.end();
+  showCount('Time’s up', true);
+  setTimeout(() => showEnd(isBest, before, after), 1000);
+}
+function showEnd(isBest, before, after) {
+  if (G.mode !== 'over') return;
+  hud.hidden = true;
+  const notes = [];
+  if (isBest && G.score > 0) notes.push('New personal best');
+  if (after.i > before.i) notes.push('Rank up: ' + after.name);
+  $('endNote').textContent = notes.join('. ');
+  $('endNote').hidden = notes.length === 0;
+  $('endScore').textContent = fmt(G.score);
+  const shots = G.hits + G.misses;
+  $('stAcc').textContent = shots ? Math.round(G.hits / shots * 100) + '%' : '–';
+  $('stCombo').textContent = G.maxCombo;
+  $('stLevel').textContent = G.level;
+  $('stPopped').textContent = G.popped;
+  const list = $('endStampList'); list.innerHTML = '';
+  for (const b of G.newBadges) list.append(stampItem(b, true));
+  $('endStamps').hidden = G.newBadges.length === 0;
+  $('endRank').textContent = after.name;
+  $('endXp').textContent = `+${fmt(G.score)} XP`;
+  $('endBar').style.transform = `scaleX(${after.frac.toFixed(4)})`;
+  $('endNext').textContent = after.next ? `${fmt(after.next.xp - save.xp)} XP to ${after.next.name}` : 'Top rank reached.';
+  endPanel.hidden = false;
+  announce(`Round over. ${fmt(G.score)} points.`);
+  $('againBtn').focus();
+}
+
+/* ================================================================
+   Camera availability
+   ================================================================ */
+let camBlocked = false;     // the frame this page runs in doesn't allow the camera
+let downloads = null;       // viewer save capability, when the page is hosted in Claude
+let inFrame = true;
+try { inFrame = window.self !== window.top; } catch (e) { inFrame = true; }
+function policyBlocksCamera() {
+  try {
+    const fp = document.permissionsPolicy || document.featurePolicy;
+    if (fp && typeof fp.allowsFeature === 'function') return !fp.allowsFeature('camera');
+  } catch (e) { /* unknown */ }
+  return null;
+}
+async function cameraPermission() {
+  try { return (await navigator.permissions.query({ name: 'camera' })).state; } catch (e) { return null; }
+}
+function showBlocked() {
+  const status = $('camStatus');
+  status.classList.add('error');
+  status.textContent = (downloads && PRISTINE)
+    ? 'This viewer doesn’t give pages camera access, so your browser blocks it without asking. Download the game and open the file in Chrome, Edge or Firefox to play with your camera. Mouse and touch work here.'
+    : 'This viewer doesn’t give pages camera access, so your browser blocks it without asking. Open the game file in its own browser tab to use your camera, or play with mouse or touch here.';
+}
+async function saveCopy() {
+  if (!downloads || !PRISTINE) return;
+  const status = $('camStatus');
+  try {
+    await downloads.save({ filename: 'flicker.html', data: PRISTINE });
+    status.classList.remove('error');
+    status.textContent = 'Saved. Open flicker.html from your downloads in Chrome, Edge or Firefox, then turn on the camera there.';
+  } catch (err) {
+    const code = err && err.code;
+    if (code === 'declined') return;
+    if (code === 'rate_limited') { status.textContent = 'A save prompt is already open. Finish that one first.'; return; }
+    downloads = null; setInputUI();
+    status.classList.add('error');
+    status.textContent = 'Saving files isn’t available in this viewer. Play with mouse or touch here, or open the game file in its own browser tab.';
+  }
+}
+
+/* ================================================================
+   Input setup
+   ================================================================ */
+async function startCamera() {
+  sfx.unlock();
+  const status = $('camStatus');
+  status.classList.remove('error');
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    status.classList.add('error');
+    status.textContent = 'This browser can’t open a camera on this page. Try a current Chrome, Edge, Safari or Firefox over https, or play with mouse or touch.';
+    return;
+  }
+  if (policyBlocksCamera() === true) { camBlocked = true; showBlocked(); setInputUI(); return; }
+  status.textContent = 'Waiting for camera permission…';
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } }, audio: false,
+    });
+    video.srcObject = stream;
+    await video.play().catch(() => {});
+    if (!video.videoWidth) await new Promise((res) => video.addEventListener('loadedmetadata', res, { once: true }));
+    input = 'camera';
+    if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
+      rvfc = true;
+      const onFrame = () => { newVideoFrame = true; video.requestVideoFrameCallback(onFrame); };
+      video.requestVideoFrameCallback(onFrame);
+    }
+    video.addEventListener('resize', layout);
+    setInputUI(); layout();
+    status.textContent = 'Camera is on. Your movement shows up as pink dots.';
+    G.practiceAt = G.clock + 400;
+    $('playBtn').focus();
+  } catch (err) {
+    status.classList.add('error');
+    const name = err && err.name;
+    if (name === 'NotAllowedError' || name === 'SecurityError') {
+      const state = await cameraPermission();
+      if (state === 'denied') {
+        status.textContent = 'The camera is turned off for this site. Allow it from the camera or lock icon in the address bar, then press Turn on camera again.';
+      } else if (inFrame) {
+        camBlocked = true; showBlocked(); setInputUI();
+      } else {
+        status.textContent = 'Camera access was refused. Allow the camera from the address bar and try again, or play with mouse or touch.';
+      }
+    } else if (name === 'NotFoundError' || name === 'OverconstrainedError') {
+      status.textContent = 'No camera was found. Connect one and try again, or play with mouse or touch.';
+    } else if (name === 'NotReadableError') {
+      status.textContent = 'The camera is in use by another app. Close it there and try again.';
+    } else {
+      status.textContent = 'The camera didn’t start. Try again, or play with mouse or touch.';
+    }
+  }
+}
+function usePointer() {
+  sfx.unlock();
+  input = 'pointer';
+  setInputUI(); layout();
+  $('camStatus').classList.remove('error');
+  $('camStatus').textContent = 'Mouse and touch mode. Your pointer paints the pink dots the camera would.';
+  G.practiceAt = G.clock + 300;
+  $('playBtn').focus();
+}
+
+/* ================================================================
+   Wiring
+   ================================================================ */
+$('camBtn').addEventListener('click', startCamera);
+$('pointerBtn').addEventListener('click', usePointer);
+$('dlBtn').addEventListener('click', saveCopy);
+$('playBtn').addEventListener('click', beginCountdown);
+$('againBtn').addEventListener('click', beginCountdown);
+$('menuBtn').addEventListener('click', showStart);
+$('resumeBtn').addEventListener('click', resumeGame);
+$('quitBtn').addEventListener('click', endRound);
+$('pauseBtn').addEventListener('click', () => (G.mode === 'paused' ? resumeGame() : pauseGame()));
+
+const sens = $('sens');
+sens.value = save.sens; $('sensOut').textContent = SENS[save.sens].name;
+sens.addEventListener('input', () => { save.sens = +sens.value; $('sensOut').textContent = SENS[save.sens].name; persist(); });
+
+function syncToggles() {
+  $('trailBtn').setAttribute('aria-pressed', String(save.trails));
+  $('soundBtn').setAttribute('aria-pressed', String(save.sound));
+}
+function toggleTrails() { save.trails = !save.trails; persist(); syncToggles(); }
+$('trailBtn').addEventListener('click', toggleTrails);
+$('soundBtn').addEventListener('click', () => { save.sound = !save.sound; persist(); syncToggles(); if (save.sound) sfx.unlock(); });
+syncToggles();
+
+window.addEventListener('keydown', (e) => {
+  const inField = e.target && e.target.closest && e.target.closest('input, textarea, select');
+  if (e.key === ' ' || e.key === 'p' || e.key === 'P' || e.key === 'Escape') {
+    if (G.mode === 'playing') { e.preventDefault(); pauseGame(); return; }
+    if (G.mode === 'paused' && e.key !== 'Escape' && !(e.key === ' ' && e.target && e.target.tagName === 'BUTTON')) { e.preventDefault(); resumeGame(); return; }
+  }
+  if ((e.key === 'm' || e.key === 'M') && !inField) toggleTrails();
+});
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) pauseGame();
+  else { M.frames = 0; lastT = performance.now(); }
+});
+if ('ResizeObserver' in window) new ResizeObserver(() => layout()).observe(stage);
+else window.addEventListener('resize', layout);
+
+/* boot */
+if (policyBlocksCamera() === true) { camBlocked = true; showBlocked(); }
+setInputUI();
+if (window.claude && typeof window.claude.use === 'function') {
+  window.claude.use('downloads').then((ns) => {
+    downloads = ns || null;
+    if (camBlocked) showBlocked();
+    setInputUI();
+  }).catch(() => {});
+}
+layout();
+refreshStart();
+drawHud();
+requestAnimationFrame((t) => { lastT = t; requestAnimationFrame(frame); });
+})();
+</script>
+</body>
+</html>
