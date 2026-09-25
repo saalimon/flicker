@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { mockClassify } from "./mock";
-import { MODES } from "./types";
+import { MODES, type ModeKey } from "./types";
 
 describe("mockClassify", () => {
   test("relaxing game for my kids, no bombs → zen, easy, kids, no hazards", () => {
@@ -37,7 +37,7 @@ describe("mockClassify", () => {
     expect(r.pace.value).toBe("frantic");
   });
 
-  test.each([
+  test.each<[string, ModeKey]>([
     ["hard mode with lots of bombs", "classic"],
     ["make it neon", "classic"],
     ["2 minute workout to keep me moving", "classic"],

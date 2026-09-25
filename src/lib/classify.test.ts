@@ -55,6 +55,19 @@ describe("classify", () => {
     await expect(p).rejects.toThrow("Aborted");
   });
 
+  test("still falls back when the browser has no AbortSignal.any (Safari < 17.4)", async () => {
+    const any = AbortSignal.any;
+    // @ts-expect-error simulate an older browser
+    delete AbortSignal.any;
+    try {
+      const r = await classify("relaxing zen game", new AbortController().signal, { useMock: false, fetchImpl: respond(404, {}) });
+      expect(r.source).toBe("mock");
+      expect(r.mode.value).toBe("zen");
+    } finally {
+      AbortSignal.any = any;
+    }
+  });
+
   test("cuts very long input before sending it", async () => {
     let sent = "";
     const fetchImpl = (async (_u: string, init: RequestInit) => {

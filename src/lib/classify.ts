@@ -18,6 +18,20 @@ export type ClassifyOptions = {
 
 const abortError = () => new DOMException("Aborted", "AbortError");
 
+/** AbortSignal.any, with a fallback for browsers that lack it (Safari < 17.4). */
+function anySignal(signals: AbortSignal[]): AbortSignal {
+  if (typeof AbortSignal.any === "function") return AbortSignal.any(signals);
+  const ac = new AbortController();
+  for (const s of signals) {
+    if (s.aborted) {
+      ac.abort(s.reason);
+      break;
+    }
+    s.addEventListener("abort", () => ac.abort(s.reason), { once: true });
+  }
+  return ac.signal;
+}
+
 export async function classify(text: string, signal?: AbortSignal, opts: ClassifyOptions = {}): Promise<IntentResult> {
   const {
     useMock = process.env.NEXT_PUBLIC_USE_MOCK === "true",
@@ -30,7 +44,7 @@ export async function classify(text: string, signal?: AbortSignal, opts: Classif
   if (useMock) return mockClassify(input);
 
   const timeout = AbortSignal.timeout(timeoutMs);
-  const both = signal ? AbortSignal.any([signal, timeout]) : timeout;
+  const both = signal ? anySignal([signal, timeout]) : timeout;
   try {
     const res = await fetchImpl(`${basePath}/api/intent`, {
       method: "POST",
